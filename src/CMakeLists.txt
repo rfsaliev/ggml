@@ -238,6 +238,24 @@ if (GGML_BLAS)
     endif()
 endif()
 
+if (GGML_DNNL)
+    find_package(dnnl)
+    if (dnnl_FOUND)
+        message(STATUS "OneDNN found")
+
+        set(GGML_HEADERS_DNNL ggml-dnnl.h)
+        set(GGML_SOURCES_DNNL ggml-dnnl.cpp)
+
+        set(GGML_EXTRA_INCS  ${GGML_EXTRA_INCS}  ${CLBLAST_INC} ${OPENCL_INC})
+        set(GGML_EXTRA_LIBS  ${GGML_EXTRA_LIBS} DNNL::dnnl)
+        set(GGML_EXTRA_FLAGS ${GGML_EXTRA_FLAGS} -DGGML_USE_DNNL)
+
+        set(GGML_DNNL_SOURCES ggml-dnnl.cpp ggml-dnnl.h)
+    else()
+        message(WARNING "OneDNN not found")
+    endif()
+endif()
+
 if (GGML_CUBLAS)
     message(WARNING "GGML_CUBLAS is deprecated and will be removed in the future.\nUse GGML_CUDA instead")
     set(GGML_CUDA ON)
@@ -578,6 +596,7 @@ add_library(${TARGET}
     ${GGML_SOURCES_METAL} ${GGML_HEADERS_METAL}
     ${GGML_SOURCES_RPC}   ${GGML_HEADERS_RPC}
     ${GGML_SOURCES_BLAS}  ${GGML_HEADERS_BLAS}
+    ${GGML_DNNL_SOURCES}
     )
 
 target_include_directories(${TARGET} PUBLIC

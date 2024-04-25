@@ -19,3 +19,7 @@ endif()
 if (GGML_METAL)
     add_compile_definitions(GGML_USE_METAL)
 endif()
+
+if (GGML_DNNL)
+    add_compile_definitions(GGML_USE_DNNL)
+endif()

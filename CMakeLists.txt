@@ -54,6 +54,7 @@ option(GGML_NO_ACCELERATE           "ggml: disable Accelerate framework"      OF
 option(GGML_BLAS                    "ggml: use BLAS"                          ${GGML_BLAS_DEFAULT})
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                     "ggml: BLAS library vendor")
+option(GGML_DNNL                    "ggml: use OneDNN"                        OFF)
 option(GGML_HIPBLAS                 "ggml: use hipBLAS"                       OFF)
 option(GGML_CUDA                    "ggml: use CUDA"                          OFF)
 option(GGML_CUBLAS                  "ggml: use CUDA (deprecated)"             OFF)
