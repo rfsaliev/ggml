@@ -503,6 +503,9 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
 #ifdef GGML_USE_METAL
                 || ggml_backend_is_metal(backend)
 #endif
+#ifdef GGML_USE_DNNL
+                 || ggml_backend_is_dnnl(backend)
+#endif
                 ) {
                 // for the CPU and Metal backend, we can read directly into the tensor
                 fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
