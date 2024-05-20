@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 #include <dnnl.hpp>
@@ -189,6 +190,28 @@ dnnl::memory ggml_tensor_to_dnnl_mem(ggml_backend_t backend, const struct ggml_t
     return dst_mem;
 }
 
+static bool adjust_for_dnnl_broadcast(dnnl::memory::dims& src0, dnnl::memory::dims& src1, dnnl::memory::dims& dst, size_t n_dims_to_keep = 0) {
+    GGML_ASSERT(src0.size() == src1.size() && src0.size() == dst.size());
+
+    bool changed = false;
+    for (size_t i = 0; i < dst.size() - n_dims_to_keep; i++) {
+        if (src0[i] != src1[i] && src0[i] != 1 && src1[i] != 1){
+            // split dims
+            auto gcd = std::min(src0[i], src1[i]);
+            GGML_ASSERT(std::max(src0[i], src1[i]) % gcd == 0);
+            src0[i] /= gcd;
+            src1[i] /= gcd;
+             dst[i] /= gcd;
+            ++i;
+            src0.insert(src0.begin() + i, gcd);
+            src1.insert(src1.begin() + i, gcd);
+             dst.insert( dst.begin() + i, gcd);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 static ggml_status ggml_backend_dnnl_mul_mat(ggml_backend_t backend, struct ggml_tensor * dst) {
     auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
 
@@ -205,12 +228,39 @@ static ggml_status ggml_backend_dnnl_mul_mat(ggml_backend_t backend, struct ggml
     GGML_ASSERT(ne_d2 == ne_s2);
     GGML_ASSERT(ne_d3 == ne_s3);
 
-    auto src_mem = ggml_tensor_to_dnnl_mem(backend, src);
-    auto src_md = src_mem.get_desc();
-    auto weights_mem = ggml_tensor_to_dnnl_mem(backend, weights, true, src_md.get_data_type());
-    auto weights_md = weights_mem.get_desc();
     auto dst_mem = ggml_tensor_to_dnnl_mem(backend, dst);
-    auto dst_md = dst_mem.get_desc();
+    auto dst_md     = dst_mem.get_desc();
+    auto src_mem = ggml_tensor_to_dnnl_mem(backend, src, false, dst_md.get_data_type());
+    auto src_md     = src_mem.get_desc();
+    auto weights_mem = ggml_tensor_to_dnnl_mem(backend, weights, true, dst_md.get_data_type());
+    auto weights_md = weights_mem.get_desc();
+
+    // adjust mems
+    auto src_dims = src_md.get_dims();
+    auto weights_dims = weights_md.get_dims();
+    auto  dst_dims =  dst_md.get_dims();
+
+    if (!std::equal(src_dims.begin(), src_dims.end()-2, weights_dims.begin())) {
+        fprintf(stderr, "\nMUL_MAT BROADCAST\n");
+    }
+
+    bool adjusted = adjust_for_dnnl_broadcast(src_dims, weights_dims, dst_dims, 2);
+    dnnl::memory wm;
+    dnnl::memory sm;
+    dnnl::memory dm;
+    if (adjusted) {
+        src_md = src_md.reshape(src_dims);
+        wm = src_mem;
+        src_mem = dnnl::memory{src_md, src_mem.get_engine(), src_mem.get_data_handle()};
+
+        wm = weights_mem;
+        weights_md = weights_md.reshape(weights_dims);
+        weights_mem = dnnl::memory{weights_md, weights_mem.get_engine(), weights_mem.get_data_handle()};
+
+        dm = dst_mem;
+        dst_md = dst_md.reshape(dst_dims);
+        dst_mem = dnnl::memory(dst_md, dst_mem.get_engine(), dst_mem.get_data_handle());
+    }
 
     auto pd = dnnl::matmul::primitive_desc{ctx->engine, src_md, weights_md, dst_md};
     auto prim = dnnl::matmul{pd};
@@ -354,9 +404,20 @@ static ggml_status ggml_backend_dnnl_softmax(ggml_backend_t backend, struct ggml
     auto src_mem = ggml_tensor_to_dnnl_mem(backend, src);
     auto dst_mem = ggml_tensor_to_dnnl_mem(backend, dst);
 
+    float input_scale = reinterpret_cast<float*>(dst->op_params)[0];
+    //auto scaled_mem = dnnl::memory{src_mem.get_desc(), src_mem.get_engine()};
+    // scale input
+    if (input_scale != 1.0f) {
+        auto pd = dnnl::eltwise_forward::primitive_desc{ctx->engine, dnnl::prop_kind::forward_inference, dnnl::algorithm::eltwise_linear, src_mem.get_desc(), src_mem.get_desc(), input_scale};
+        auto prim = dnnl::eltwise_forward{pd};
+        prim.execute(ctx->stream, {
+            {DNNL_ARG_SRC, src_mem},
+            {DNNL_ARG_DST, src_mem},
+        });
+    }
     //float alpha  = *reinterpret_cast<float*>(dst->op_params);
-
-    auto pd = dnnl::softmax_forward::primitive_desc{ctx->engine, dnnl::prop_kind::forward, dnnl::algorithm::softmax_accurate, src_mem.get_desc(), dst_mem.get_desc(), 0};
+    const int axis = src_mem.get_desc().get_dims().size() - 1;
+    auto pd = dnnl::softmax_forward::primitive_desc{ctx->engine, dnnl::prop_kind::forward_inference, dnnl::algorithm::softmax_accurate, src_mem.get_desc(), dst_mem.get_desc(), axis};
     auto prim = dnnl::softmax_forward{pd};
     prim.execute(ctx->stream, {
         {DNNL_ARG_SRC, src_mem},
@@ -392,7 +453,7 @@ static ggml_status ggml_backend_dnnl_binary(ggml_backend_t backend, struct ggml_
     auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
     auto src0 = dst->src[0];
     auto src1 = dst->src[1];
-    // oneDNN supports in-place only for src0
+    // oneDNN supports in-place for src0 only
     if (src1->data == dst->data) {
         std::swap(src0, src1);
     }
@@ -401,7 +462,28 @@ static ggml_status ggml_backend_dnnl_binary(ggml_backend_t backend, struct ggml_
     auto src1_mem = ggml_tensor_to_dnnl_mem(backend, src1);
     auto dst_mem  = ggml_tensor_to_dnnl_mem(backend, dst);
 
-    auto pd = dnnl::binary::primitive_desc{ctx->engine, op, src0_mem.get_desc(), src1_mem.get_desc(), dst_mem.get_desc()};
+    // adjust mems
+    auto src0_md = src0_mem.get_desc();
+    auto src1_md = src1_mem.get_desc();
+    auto  dst_md =  dst_mem.get_desc();
+
+    auto src0_dims = src0_md.get_dims();
+    auto src1_dims = src1_md.get_dims();
+    auto  dst_dims =  dst_md.get_dims();
+
+    bool adjusted = adjust_for_dnnl_broadcast(src0_dims, src1_dims, dst_dims);
+    if (adjusted) {
+        src0_md = src0_md.reshape(src0_dims);
+        src0_mem = dnnl::memory{src0_md, src0_mem.get_engine(), src0_mem.get_data_handle()};
+
+        src1_md = src1_md.reshape(src1_dims);
+        src1_mem = dnnl::memory{src1_md, src1_mem.get_engine(), src1_mem.get_data_handle()};
+
+        dst_md = dst_md.reshape(dst_dims);
+        dst_mem = dnnl::memory(dst_md, dst_mem.get_engine(), dst_mem.get_data_handle());
+    }
+
+    auto pd = dnnl::binary::primitive_desc{ctx->engine, op, src0_md, src1_md, dst_md};
     auto prim = dnnl::binary{pd};
     prim.execute(ctx->stream, {
         {DNNL_ARG_SRC_0, src0_mem},
