@@ -138,15 +138,17 @@ dnnl::memory::desc ggml_tensor_to_dnnl_md(const struct ggml_tensor * t, bool tra
 
     GGML_TENSOR_LOCALS(int64_t, ne, t, ne)
     GGML_TENSOR_LOCALS(size_t,  nb, t, nb)
+    const auto tensor_type = t->type;
 
     auto adims = dims{ne3, ne2, (transpose ? ne0 : ne1), (transpose ? ne1 : ne0)};
     auto dt = dtype != dnnl::memory::data_type::undef
-              ? dtype : ggml_type_to_dnnl_dtype(t->type);
+              ? dtype : ggml_type_to_dnnl_dtype(tensor_type);
+    auto type_size = ggml_type_size(tensor_type);
     auto strides = dims{
-                        (dim)(nb3/nb0),
-                        (dim)(nb2/nb0),
-                        (dim)((transpose ? nb0 : nb1)/nb0),
-                        (dim)((transpose ? nb1 : nb0)/nb0)
+                        (dim)(nb3/type_size),
+                        (dim)(nb2/type_size),
+                        (dim)((transpose ? nb0 : nb1)/type_size),
+                        (dim)((transpose ? nb1 : nb0)/type_size)
                   };
     return dnnl::memory::desc{adims, dt, strides};
 }
