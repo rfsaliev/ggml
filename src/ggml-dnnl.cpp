@@ -78,6 +78,8 @@ static dnnl::memory::data_type ggml_type_to_dnnl_dtype(enum ggml_type type) {
             return dt::s32;
         case GGML_TYPE_F64:
             return dt::f64;
+        // case GGML_TYPE_BF16:
+        //     return dt::bf16;
         default:
             return dt::undef;
     }
@@ -131,25 +133,36 @@ static bool ggml_compute_forward_mul_mat_use_dnnl(const struct ggml_tensor * dst
 #endif
 }
 
-dnnl::memory::desc ggml_tensor_to_dnnl_md(const struct ggml_tensor * t, bool transpose = false, dnnl::memory::data_type dtype = dnnl::memory::data_type::undef) {
+dnnl::memory::desc ggml_tensor_to_dnnl_md(const struct ggml_tensor * t, bool transpose = false,
+                                          dnnl::memory::data_type dtype = dnnl::memory::data_type::undef,
+                                          size_t ndims = GGML_MAX_DIMS) {
     GGML_ASSERT(ggml_dnnl_tensor_supported(t));
-    using dim = dnnl::memory::dim;
-    using dims = dnnl::memory::dims;
+    GGML_ASSERT(ndims > 0);
+    using dims_t = dnnl::memory::dims;
 
-    GGML_TENSOR_LOCALS(int64_t, ne, t, ne)
-    GGML_TENSOR_LOCALS(size_t,  nb, t, nb)
     const auto tensor_type = t->type;
-
-    auto adims = dims{ne3, ne2, (transpose ? ne0 : ne1), (transpose ? ne1 : ne0)};
     auto dt = dtype != dnnl::memory::data_type::undef
               ? dtype : ggml_type_to_dnnl_dtype(tensor_type);
     auto type_size = ggml_type_size(tensor_type);
-    auto strides = dims{
-                        (dim)(nb3/type_size),
-                        (dim)(nb2/type_size),
-                        (dim)((transpose ? nb0 : nb1)/type_size),
-                        (dim)((transpose ? nb1 : nb0)/type_size)
-                  };
+
+    dims_t adims(ndims);
+    dims_t strides(ndims);
+
+    for (size_t i = 0; i < ndims; i++ ) {
+        adims[ndims - 1 - i] = t->ne[i];
+        strides[ndims - 1 - i] = t->nb[i] / type_size;
+    }
+
+    if (transpose) {
+        std::swap(adims[ndims-1], adims[ndims-2]);
+        std::swap(strides[ndims-1], strides[ndims-2]);
+    }
+
+    for (size_t i = ndims; i < GGML_MAX_DIMS; i++) {
+        GGML_ASSERT(t->nb[i] == t->nb[i-1] * t->ne[i-1]);
+        adims[0] *= t->ne[i];
+    }
+
     return dnnl::memory::desc{adims, dt, strides};
 }
 
@@ -173,13 +186,14 @@ static void* get_memory_handle(const struct ggml_tensor * t) {
 #endif
 
 dnnl::memory ggml_tensor_to_dnnl_mem(ggml_backend_t backend, const struct ggml_tensor * t, bool transpose = false,
-                                           dnnl::memory::data_type convert_to = dnnl::memory::data_type::undef) {
+                                           dnnl::memory::data_type convert_to = dnnl::memory::data_type::undef,
+                                           size_t ndims = GGML_MAX_DIMS) {
     auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
 
-    auto t_md = ggml_tensor_to_dnnl_md(t, transpose);
+    auto t_md = ggml_tensor_to_dnnl_md(t, transpose, dnnl::memory::data_type::undef, ndims);
     auto t_mem = dnnl::memory{t_md, ctx->engine, get_memory_handle(t)};
 
-    auto dst_md = ggml_tensor_to_dnnl_md(t, transpose, convert_to);
+    auto dst_md = ggml_tensor_to_dnnl_md(t, transpose, convert_to, ndims);
     if (t_md.get_data_type() == dst_md.get_data_type()) {
         return t_mem;
     }
@@ -214,12 +228,55 @@ static bool adjust_for_dnnl_broadcast(dnnl::memory::dims& src0, dnnl::memory::di
     return changed;
 }
 
+static ggml_status ggml_backend_dnnl_inner_product(ggml_backend_t backend, struct ggml_tensor * dst) {
+    auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
+
+    // NOTE: src0 - weights, src1 - input
+    const struct ggml_tensor * src = dst->src[1];
+    const struct ggml_tensor * weights = dst->src[0];
+
+    GGML_TENSOR_LOCALS(int64_t, ne_s, src, ne)
+    GGML_TENSOR_LOCALS(int64_t, ne_w, weights, ne)
+    GGML_TENSOR_LOCALS(int64_t, ne_d, dst, ne)
+
+    GGML_ASSERT(ne_d0 == ne_w1);
+    GGML_ASSERT(ne_d1 == ne_s1);
+    GGML_ASSERT(ne_d2 == ne_s2);
+    GGML_ASSERT(ne_d3 == ne_s3);
+    GGML_ASSERT(ne_w2 == 1 && ne_w3 == 1);
+
+    auto dst_mem = ggml_tensor_to_dnnl_mem(backend, dst, false, dnnl::memory::data_type::undef, 2);
+    auto dst_md     = dst_mem.get_desc();
+    auto src_mem = ggml_tensor_to_dnnl_mem(backend, src, false, dst_md.get_data_type(), 2);
+    auto src_md     = src_mem.get_desc();
+    auto weights_mem = ggml_tensor_to_dnnl_mem(backend, weights, false, dst_md.get_data_type(), 2);
+    auto weights_md = weights_mem.get_desc();
+
+    auto pd = dnnl::inner_product_forward::primitive_desc{ctx->engine, dnnl::prop_kind::forward_inference, src_md, weights_md, dst_md};
+    auto prim = dnnl::inner_product_forward{pd};
+
+    std::unordered_map<int, dnnl::memory> args = {
+        {DNNL_ARG_SRC,     src_mem},
+        {DNNL_ARG_WEIGHTS, weights_mem},
+        {DNNL_ARG_DST,     dst_mem},
+    };
+
+    prim.execute(ctx->stream, args);
+    ctx->stream.wait();
+    return GGML_STATUS_SUCCESS;
+}
+
+
 static ggml_status ggml_backend_dnnl_mul_mat(ggml_backend_t backend, struct ggml_tensor * dst) {
     auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
 
     // NOTE: src0 - weights, src1 - input
     const struct ggml_tensor * src = dst->src[1];
     const struct ggml_tensor * weights = dst->src[0];
+    
+    if (weights->ne[2] == 1 && weights->ne[3] == 1) {
+        return ggml_backend_dnnl_inner_product(backend, dst);
+    }
 
     GGML_TENSOR_LOCALS(int64_t, ne_s, src, ne)
     GGML_TENSOR_LOCALS(int64_t, ne_w, weights, ne)
@@ -513,55 +570,11 @@ static ggml_status ggml_backend_dnnl_unary(ggml_backend_t backend, struct ggml_t
     return GGML_STATUS_SUCCESS;
 }
 
-///////////////// cpy from ggml.c
 // ggml_compute_forward_get_rows
+static ggml_status ggml_backend_dnnl_get_rows_impl(ggml_backend_t backend, struct ggml_tensor * dst) {
+    auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
 
-static void ggml_compute_forward_get_rows_f16(ggml_backend_t backend, struct ggml_tensor * dst) {
-    GGML_UNUSED(backend);
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int64_t nc = ne00;
-    const int64_t nr = ggml_nelements(src1);
-
-    GGML_ASSERT(ne0  == nc);
-    GGML_ASSERT(ne02 == ne11);
-    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
-    GGML_ASSERT(ggml_nrows(dst) == nr);
-
-    const int ith = 0;
-    const int nth = 1;
-
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = std::min((int64_t)ir0 + dr, nr);
-
-    auto ggml_fp16_to_fp32_row = [](const ggml_fp16_t * x, float * y, int64_t n) {
-        for (int64_t i = 0; i < n; i++) {
-            y[i] = GGML_FP16_TO_FP32(x[i]);
-        }
-    };
-
-
-    for (int64_t i = ir0; i < ir1; ++i) {
-        const int64_t i12 = i/(ne11*ne10);
-        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
-        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-
-        ggml_fp16_to_fp32_row(
-                (const ggml_fp16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
-                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
-    }
-}
-
-static void ggml_compute_forward_get_rows_f32(ggml_backend_t backend, struct ggml_tensor * dst) {
-    GGML_UNUSED(backend);
+    using dims_t = dnnl::memory::dims;
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -573,71 +586,54 @@ static void ggml_compute_forward_get_rows_f32(ggml_backend_t backend, struct ggm
 
     GGML_ASSERT(ne0  == nc);
     GGML_ASSERT(ne02 == ne11);
-    GGML_ASSERT(nb00 == sizeof(float));
     GGML_ASSERT(ggml_nrows(dst) == nr);
 
-    const int ith = 0;
-    const int nth = 1;
+    auto src0_mem = ggml_tensor_to_dnnl_mem(backend, src0);
+    auto src1_mem = ggml_tensor_to_dnnl_mem(backend, src1);
+    auto dst_mem  = ggml_tensor_to_dnnl_mem(backend, dst);
 
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
+    // adjust mems
+    auto src0_md = src0_mem.get_desc();
+    auto src1_md = src1_mem.get_desc();
+    auto  dst_md =  dst_mem.get_desc();
 
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = std::min((int64_t)ir0 + dr, nr);
+    auto src0_dims = src0_md.get_dims();
+    auto src1_dims = src1_md.get_dims();
+    auto  dst_dims =  dst_md.get_dims();
 
-    auto ggml_vec_cpy_f32 = [](const int n, float * y, const float * x)
-                      { for (int i = 0; i < n; ++i) y[i]  = x[i]; };
+    auto src1_ptr = map_memory<char>(src1_mem);
 
-    for (int64_t i = ir0; i < ir1; ++i) {
+    auto row_dims = dims_t{1,1,1,nc};
+
+    for (int64_t i = 0; i < nr; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
-        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        const int64_t i01 = *(int32_t *) (src1_ptr.get() + i10*nb10 + i11*nb11 + i12*nb12);
 
-        ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+        auto src_offset = dims_t{i12, i11, i01, 0};
+        auto dst_offset = dims_t{i12, i11, i10, 0};
+        auto src_sub_md = src0_md.submemory_desc(row_dims, src_offset);
+        auto dst_sub_md = dst_md.submemory_desc(row_dims, dst_offset);
+        auto src_submem = dnnl::memory{src_sub_md, src0_mem.get_engine(), src0_mem.get_data_handle()};
+        auto dst_submem = dnnl::memory{dst_sub_md, dst_mem.get_engine(), dst_mem.get_data_handle()};
+
+        dnnl::reorder prim{src_submem, dst_submem};
+        prim.execute(ctx->stream, src_submem, dst_submem);
+        ctx->stream.wait();
     }
+    return GGML_STATUS_SUCCESS;
 }
 
 static ggml_status ggml_backend_dnnl_get_rows(ggml_backend_t backend, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
 
-    switch (src0->type) {
-        case GGML_TYPE_F16:
-            {
-                ggml_compute_forward_get_rows_f16(backend, dst);
-            } break;
-        case GGML_TYPE_F32:
-        case GGML_TYPE_I32:
-            {
-                ggml_compute_forward_get_rows_f32(backend, dst);
-            } break;
-        default:
-            {
-                GGML_ASSERT(false);
-                return GGML_STATUS_FAILED;
-            } break;
+    if (!(ggml_dnnl_tensor_supported(dst) && ggml_dnnl_tensor_supported(src0))) {
+        GGML_ASSERT(false);
+        return GGML_STATUS_FAILED;
     }
-    return GGML_STATUS_SUCCESS;
-    //static bool first = true;
-    //printf("ne0 = %d, ne1 = %d, ne2 = %d\n", dst->ne[0], dst->ne[1], dst->ne[2]);
-    //if (first) {
-    //    first = false;
-    //} else {
-    //    for (int k = 0; k < dst->ne[1]; ++k) {
-    //        for (int j = 0; j < dst->ne[0]/16; ++j) {
-    //            for (int i = 0; i < 16; ++i) {
-    //                printf("%8.4f ", ((float *) dst->data)[k*dst->ne[0] + j*16 + i]);
-    //            }
-    //            printf("\n");
-    //        }
-    //        printf("\n");
-    //    }
-    //    printf("\n");
-    //    exit(0);
-    //}
+
+    return ggml_backend_dnnl_get_rows_impl(backend, dst);
 }
 ///////////////////////////
 
@@ -833,9 +829,11 @@ GGML_CALL static void * ggml_backend_dnnl_buffer_get_base(ggml_backend_buffer_t 
 
 static void ggml_backend_dnnl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(buffer == tensor->buffer);
+
     if (tensor->view_src != NULL && tensor->view_offs == 0) {
         tensor->extra = tensor->view_src->extra;
     } else {
+    printf(" op:%s-'%s'\n", ggml_op_desc(tensor), tensor->name);
         auto buf = tensor->view_src != NULL ? tensor->view_src->buffer : tensor->buffer;
         ggml_backend_dnnl_buffer_context* ctx = (ggml_backend_dnnl_buffer_context*)buf->context;
         dnnl::memory::dim offset = (uintptr_t)tensor->data - DNNL_BUFFER_BASE;
@@ -1007,14 +1005,15 @@ GGML_CALL static const char * ggml_backend_dnnl_name(ggml_backend_t backend) {
 }
 
 GGML_CALL static void ggml_backend_dnnl_free(ggml_backend_t backend) {
-    GGML_ASSERT(ggml_backend_is_dnnl(backend));
-    auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
+    GGML_UNUSED(backend);
+    // GGML_ASSERT(ggml_backend_is_dnnl(backend));
+    // auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
 
-    if (ctx != nullptr) {
-        delete ctx;
-    }
+    // if (ctx != nullptr) {
+    //     delete ctx;
+    // }
 
-    delete backend;
+    // delete backend;
 }
 
 GGML_CALL static void ggml_backend_dnnl_synchronize(ggml_backend_t backend) {
@@ -1062,6 +1061,7 @@ GGML_CALL static bool ggml_backend_dnnl_supports_op(ggml_backend_t backend, cons
         case GGML_OP_DIAG_MASK_ZERO:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX:
+        case GGML_OP_GET_ROWS:
             return ggml_dnnl_tensor_supported(op) && ggml_dnnl_tensor_supported(op->src[0]);
         case GGML_OP_MUL_MAT:
             return ggml_compute_forward_mul_mat_use_dnnl(op);
@@ -1131,12 +1131,12 @@ GGML_CALL ggml_backend_t ggml_backend_dnnl_init() {
     // GGML_ASSERT(s_dnnl_context == nullptr);
     // s_dnnl_context = new ggml_dnnl_context(device);
 
-    ggml_dnnl_context* dnnl_context = new ggml_dnnl_context(0);
+    static ggml_dnnl_context dnnl_context_{0};
 
     ggml_backend_t dnnl_backend = new ggml_backend {
         /* .guid      = */ ggml_backend_dnnl_guid(),
         /* .interface = */ dnnl_backend_i,
-        /* .context   = */ dnnl_context,
+        /* .context   = */ &dnnl_context_,
     };
 
     return dnnl_backend;
@@ -1158,7 +1158,7 @@ GGML_CALL static ggml_backend_t ggml_backend_reg_dnnl_init(const char * params, 
 extern "C" GGML_CALL int ggml_backend_dnnl_reg_devices(void);
 
 GGML_CALL int ggml_backend_dnnl_reg_devices() {
-    ggml_backend_register(ggml_backend_dnnl_name_str, ggml_backend_reg_dnnl_init, ggml_backend_dnnl_get_default_buffer_type(NULL), NULL);
+    ggml_backend_register(ggml_backend_dnnl_name_str, ggml_backend_reg_dnnl_init, ggml_backend_dnnl_get_default_buffer_type(ggml_backend_dnnl_init()), NULL);
     int device_count = 1;
     return device_count;
 }
