@@ -6,7 +6,9 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <functional>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 #include <dnnl.hpp>
@@ -115,7 +117,25 @@ static bool ggml_dnnl_tensor_supported(const struct ggml_tensor * t) {
     return true;
 }
 
-static bool ggml_compute_forward_mul_mat_use_dnnl(const struct ggml_tensor * dst) {
+static bool are_same_descs(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+    return t0->type == t1->type
+           && ggml_are_same_shape(t0, t1)
+           && ggml_are_same_stride(t0, t1);
+}
+
+static bool unary_tensor_supported(ggml_backend_t, const ggml_tensor* op) {
+    return are_same_descs(op, op->src[0])
+           && ggml_dnnl_tensor_supported(op)
+           && ggml_dnnl_tensor_supported(op->src[0]);
+}
+
+static bool binary_tensor_supported(ggml_backend_t, const ggml_tensor* op) {
+    return ggml_dnnl_tensor_supported(op)
+           && ggml_dnnl_tensor_supported(op->src[0])
+           && ggml_dnnl_tensor_supported(op->src[1]);
+}
+
+static bool ggml_compute_forward_mul_mat_use_dnnl(ggml_backend_t, const struct ggml_tensor * dst) {
 #if 0
     return true;
     GGML_UNUSED(dst);
@@ -123,21 +143,36 @@ static bool ggml_compute_forward_mul_mat_use_dnnl(const struct ggml_tensor * dst
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    if (true
-        && dst->op != GGML_OP_MUL_MAT_ID
-        && ggml_dnnl_tensor_supported(src0)
-        && ggml_dnnl_tensor_supported(src1)
-        && ggml_dnnl_tensor_supported(dst)
-        && ggml_is_contiguous(src0)
-        && ggml_is_contiguous(src1)
-        // && (ne0 >= 32 && ne1 >= 32 && ne10 >= 32)
-        ) {
+    bool ok = dst->op != GGML_OP_MUL_MAT_ID
+            && ggml_dnnl_tensor_supported(src0)
+            && ggml_dnnl_tensor_supported(src1)
+            && ggml_dnnl_tensor_supported(dst)
+            && ggml_is_contiguous(src0)
+            && ggml_is_contiguous(src1);
+    if (!ok) {
+        return false;
+    }
+
+    const int64_t ne10 = src1->ne[0];
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+
+    // TODO: find the optimal values for these
+    if (ne0 >= 32 && ne1 >= 32 && ne10 >= 32) {
 
         /*printf("BLAS: %d %d %d %d %d\n", ne0, ne1, ne10, ne00, ne01);*/
         return true;
     }
 
-    return false;
+    // OneDNN support only 1->N broadcasts
+    for (size_t i = 2; i < GGML_MAX_DIMS; ++i) {
+        if (src0->ne[i] != src1->ne[i] && src0->ne[i] != 1 && src1->ne[i] != 1) {
+            return false;
+        }
+    }
+
+    return ok;
 #endif
 }
 
@@ -288,27 +323,23 @@ static ggml_status ggml_backend_dnnl_mul_mat(ggml_backend_t backend, struct ggml
     auto weights_dims = weights_md.get_dims();
     auto  dst_dims =  dst_md.get_dims();
 
-    if (!std::equal(src_dims.begin(), src_dims.end()-2, weights_dims.begin())) {
-        fprintf(stderr, "\nMUL_MAT BROADCAST\n");
-    }
+    // bool adjusted = adjust_for_dnnl_broadcast(src_dims, weights_dims, dst_dims, 2);
+    // dnnl::memory wm;
+    // dnnl::memory sm;
+    // dnnl::memory dm;
+    // if (adjusted) {
+    //     src_md = src_md.reshape(src_dims);
+    //     wm = src_mem;
+    //     src_mem = dnnl::memory{src_md, src_mem.get_engine(), src_mem.get_data_handle()};
 
-    bool adjusted = adjust_for_dnnl_broadcast(src_dims, weights_dims, dst_dims, 2);
-    dnnl::memory wm;
-    dnnl::memory sm;
-    dnnl::memory dm;
-    if (adjusted) {
-        src_md = src_md.reshape(src_dims);
-        wm = src_mem;
-        src_mem = dnnl::memory{src_md, src_mem.get_engine(), src_mem.get_data_handle()};
+    //     wm = weights_mem;
+    //     weights_md = weights_md.reshape(weights_dims);
+    //     weights_mem = dnnl::memory{weights_md, weights_mem.get_engine(), weights_mem.get_data_handle()};
 
-        wm = weights_mem;
-        weights_md = weights_md.reshape(weights_dims);
-        weights_mem = dnnl::memory{weights_md, weights_mem.get_engine(), weights_mem.get_data_handle()};
-
-        dm = dst_mem;
-        dst_md = dst_md.reshape(dst_dims);
-        dst_mem = dnnl::memory(dst_md, dst_mem.get_engine(), dst_mem.get_data_handle());
-    }
+    //     dm = dst_mem;
+    //     dst_md = dst_md.reshape(dst_dims);
+    //     dst_mem = dnnl::memory(dst_md, dst_mem.get_engine(), dst_mem.get_data_handle());
+    // }
 
     auto pd = dnnl::matmul::primitive_desc{ctx->engine, src_md, weights_md, dst_md};
     auto prim = dnnl::matmul{pd};
@@ -443,6 +474,22 @@ static ggml_status ggml_backend_dnnl_diag_mask(
             } break;
     }
     return GGML_STATUS_SUCCESS;
+}
+
+static ggml_status ggml_backend_dnnl_diag_mask_zero(ggml_backend_t b, ggml_tensor* d) {
+    return ggml_backend_dnnl_diag_mask(b, d, 0);
+}
+
+static ggml_status ggml_backend_dnnl_diag_mask_inf(ggml_backend_t b, ggml_tensor* d) {
+    return ggml_backend_dnnl_diag_mask(b, d, -INFINITY);
+}
+
+static bool ggml_backend_dnnl_softmax_supported(ggml_backend_t backend, const ggml_tensor * dst) {
+    GGML_ASSERT(dst->op == GGML_OP_SOFT_MAX);
+    // mask and bias are not supported
+    return dst->src[1] == 0
+         && dst->op_params[1] == 0
+         && unary_tensor_supported(backend, dst);
 }
 
 static ggml_status ggml_backend_dnnl_softmax(ggml_backend_t backend, struct ggml_tensor * dst) {
@@ -625,228 +672,126 @@ static ggml_status ggml_backend_dnnl_get_rows(ggml_backend_t backend, struct ggm
 }
 ///////////////////////////
 
+struct dnnl_op_handler {
+    bool     (*support_op)(ggml_backend_t, const ggml_tensor*);
+    ggml_status (*compute)(ggml_backend_t, ggml_tensor*);
+};
+
+#define NOPE_RECORD(op) \
+{ op, {\
+    [](ggml_backend_t, const ggml_tensor*){ return false; },\
+    [](ggml_backend_t, ggml_tensor*){ return GGML_STATUS_SUCCESS; }\
+}}
+
+#define UNARY_OP_RECORD(op, alg, alpha, beta) \
+{ op,\
+    { unary_tensor_supported,\
+    [](ggml_backend_t b, ggml_tensor* o) { return ggml_backend_dnnl_unary(b, o, alg, alpha, beta); }}\
+}
+
+#define BINARY_OP_RECORD(op, a) \
+{ op,\
+    { binary_tensor_supported,\
+    [](ggml_backend_t b, ggml_tensor* o) { return ggml_backend_dnnl_binary(b, o, a); }}\
+}
+
+static const std::unordered_map<ggml_unary_op, dnnl_op_handler>* ggml_dnnl_unary_op_map() {
+    using algo = dnnl::algorithm;
+    static std::unordered_map<ggml_unary_op, dnnl_op_handler> uop_map_ {
+        UNARY_OP_RECORD(GGML_UNARY_OP_ABS, algo::eltwise_abs, 1, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_TANH, algo::eltwise_tanh, 1, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_ELU, algo::eltwise_elu, 1, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_RELU, algo::eltwise_relu, 0, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_GELU, algo::eltwise_gelu_erf, 1, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_GELU_QUICK, algo::eltwise_gelu_tanh, 1, 0),
+        UNARY_OP_RECORD(GGML_UNARY_OP_HARDSWISH, algo::eltwise_hardswish, 1.f/6.f, 0.5f),
+        UNARY_OP_RECORD(GGML_UNARY_OP_HARDSIGMOID, algo::eltwise_hardsigmoid, 1.f/6.f, 0.5f),
+        // GGML_UNARY_OP_SILU,
+        // GGML_UNARY_OP_SGN,
+        // GGML_UNARY_OP_NEG,
+        // GGML_UNARY_OP_STEP,
+    };
+    return &uop_map_;
+}
+
+static bool ggml_dnnl_supports_op_unary(ggml_backend_t backend, const ggml_tensor* op) {
+    enum ggml_unary_op uop = ggml_get_unary_op(op);
+    auto uop_map_ = ggml_dnnl_unary_op_map();
+    auto it = uop_map_->find(uop);
+    return (it != uop_map_->end()) && it->second.support_op(backend, op);
+}
+
+static ggml_status ggml_dnnl_compute_op_unary(ggml_backend_t backend, ggml_tensor* op) {
+    enum ggml_unary_op uop = ggml_get_unary_op(op);
+    auto uop_map_ = ggml_dnnl_unary_op_map();
+    auto it = uop_map_->find(uop);
+    if (it == uop_map_->end()) {
+        fprintf(stderr, "%s: unsupported op %s\n", __func__, ggml_op_desc(op));
+        GGML_ASSERT(false);
+        return GGML_STATUS_FAILED;
+    }
+    return it->second.compute(backend, op);
+}
+
+static const std::unordered_map<ggml_op, dnnl_op_handler>* ggml_dnnl_op_map() {
+    using algo = dnnl::algorithm;
+
+    static std::unordered_map<ggml_op, dnnl_op_handler> op_map_ = {
+        NOPE_RECORD(GGML_OP_NONE),
+        NOPE_RECORD(GGML_OP_RESHAPE),
+        NOPE_RECORD(GGML_OP_VIEW),
+        NOPE_RECORD(GGML_OP_PERMUTE),
+        NOPE_RECORD(GGML_OP_TRANSPOSE),
+
+        // UNARY_OP_RECORD(GGML_OP_SQR,  algo::eltwise_square),
+        // UNARY_OP_RECORD(GGML_OP_SQRT, algo::eltwise_sqrt),
+        // UNARY_OP_RECORD(GGML_OP_LOG,  algo::eltwise_log),
+
+        // BINARY_OP_RECORD(GGML_OP_ADD,  algo::binary_add),
+        // BINARY_OP_RECORD(GGML_OP_ADD1, algo::binary_add), // TODO(rfsaliev) use unary
+        // BINARY_OP_RECORD(GGML_OP_SUB,  algo::binary_sub),
+        // BINARY_OP_RECORD(GGML_OP_MUL,  algo::binary_mul),
+        // BINARY_OP_RECORD(GGML_OP_DIV,  algo::binary_div),
+
+        // {GGML_OP_NORM, {unary_tensor_supported, ggml_backend_dnnl_norm }},
+        {GGML_OP_MUL_MAT, {ggml_compute_forward_mul_mat_use_dnnl, ggml_backend_dnnl_mul_mat}},
+
+        // {GGML_OP_CONT, {unary_tensor_supported, ggml_backend_dnnl_cpy }},
+        // {GGML_OP_CPY,  {unary_tensor_supported, ggml_backend_dnnl_cpy }},
+        // {GGML_OP_DUP,  {unary_tensor_supported, ggml_backend_dnnl_cpy }},
+
+        // {GGML_OP_SCALE, {unary_tensor_supported, ggml_backend_dnnl_scale }},
+        // {GGML_OP_DIAG_MASK_ZERO, {unary_tensor_supported, ggml_backend_dnnl_diag_mask_zero}},
+        // {GGML_OP_DIAG_MASK_INF,  {unary_tensor_supported, ggml_backend_dnnl_diag_mask_inf}},
+        // {GGML_OP_SOFT_MAX, {ggml_backend_dnnl_softmax_supported, ggml_backend_dnnl_softmax}},
+
+        // {GGML_OP_GET_ROWS, {unary_tensor_supported, ggml_backend_dnnl_get_rows}},
+
+        // {GGML_OP_UNARY, {ggml_dnnl_supports_op_unary, ggml_dnnl_compute_op_unary}},
+    };
+    return &op_map_;
+}
+
+#undef NOPE_RECORD
+#undef UNARY_OP_RECORD
+#undef BINARY_OP_RECORD
+
 static ggml_status ggml_backend_dnnl_node_compute(ggml_backend_t backend, struct ggml_tensor * node) {
-        switch (node->op) {
-            case GGML_OP_ADD:
-            case GGML_OP_ADD1: // TODO(rfsaliev) use unary
-                return ggml_backend_dnnl_binary(backend, node, dnnl::algorithm::binary_add);
+        auto op_map = ggml_dnnl_op_map();
+        auto it = op_map->find(node->op);
 
-        // GGML_OP_ACC,
-
-            case GGML_OP_SUB:
-                return ggml_backend_dnnl_binary(backend, node, dnnl::algorithm::binary_sub);
-            case GGML_OP_MUL:
-                return ggml_backend_dnnl_binary(backend, node, dnnl::algorithm::binary_mul);
-            case GGML_OP_DIV:
-                return ggml_backend_dnnl_binary(backend, node, dnnl::algorithm::binary_div);
-            case GGML_OP_SQR:
-                return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_square);
-            case GGML_OP_SQRT:
-                return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_sqrt);
-            case GGML_OP_LOG:
-                return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_log);
-
-            // GGML_OP_SUM,
-            // GGML_OP_SUM_ROWS,
-            // GGML_OP_MEAN,
-            // GGML_OP_ARGMAX,
-            // GGML_OP_REPEAT,
-            // GGML_OP_REPEAT_BACK,
-            // GGML_OP_CONCAT,
-            // GGML_OP_SILU_BACK,
-            case GGML_OP_NORM: // normalize
-                return ggml_backend_dnnl_norm(backend, node);
-                break;
-            // GGML_OP_RMS_NORM,
-            // GGML_OP_RMS_NORM_BACK,
-            // GGML_OP_GROUP_NORM,
-
-            case GGML_OP_MUL_MAT:
-                return ggml_backend_dnnl_mul_mat(backend, node);
-                break;
-
-            // GGML_OP_MUL_MAT_ID,
-            // GGML_OP_OUT_PROD,
-
-            // GGML_OP_SCALE,
-            // GGML_OP_SET,
-            // GGML_OP_CPY,
-            // GGML_OP_CONT,
-
-            case GGML_OP_NONE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_TRANSPOSE:
-                return GGML_STATUS_SUCCESS;
-
-            case GGML_OP_CONT:
-            case GGML_OP_CPY:
-            case GGML_OP_DUP:
-                return ggml_backend_dnnl_cpy(backend, node);
-                break;
-
-            case GGML_OP_SCALE:
-                return ggml_backend_dnnl_scale(backend, node);
-                break;
-            case GGML_OP_DIAG_MASK_ZERO:
-                return ggml_backend_dnnl_diag_mask(backend, node, 0);
-                break;
-            case GGML_OP_DIAG_MASK_INF:
-                return ggml_backend_dnnl_diag_mask(backend, node, -INFINITY);
-                break;
-            case GGML_OP_SOFT_MAX:
-                return ggml_backend_dnnl_softmax(backend, node);
-                break;
-            // TODO
-            //case GGML_OP_OUT_PROD:
-    
-            case GGML_OP_UNARY:
-            {
-                enum ggml_unary_op uop = ggml_get_unary_op(node);
-                switch(uop) {
-                    case GGML_UNARY_OP_ABS:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_abs);
-                    // GGML_UNARY_OP_SGN,
-                    // GGML_UNARY_OP_NEG,
-                    // GGML_UNARY_OP_STEP,
-                    case GGML_UNARY_OP_TANH:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_tanh);
-                    case GGML_UNARY_OP_ELU:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_elu);
-                    case GGML_UNARY_OP_RELU:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_relu);
-                    case GGML_UNARY_OP_GELU:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_gelu_erf);
-                    case GGML_UNARY_OP_GELU_QUICK:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_gelu_tanh);
-                        // GGML_UNARY_OP_SILU,
-                    case GGML_UNARY_OP_HARDSWISH:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_hardswish);
-                    case GGML_UNARY_OP_HARDSIGMOID:
-                        return ggml_backend_dnnl_unary(backend, node, dnnl::algorithm::eltwise_hardsigmoid);
-                    default:
-                        fprintf(stderr, "%s: unsupported op %s\n", __func__, ggml_op_desc(node));
-                        GGML_ASSERT(false);
-                        return GGML_STATUS_FAILED;
-                }
-            }
-            case GGML_OP_GET_ROWS:
-                return ggml_backend_dnnl_get_rows(backend, node);
-
-            default:
-                fprintf(stderr, "%s: unsupported op %s\n", __func__, ggml_op_desc(node));
-                GGML_ASSERT(false);
-                return GGML_STATUS_FAILED;
+        if (it == op_map->end()) {
+            fprintf(stderr, "%s: unsupported op %s\n", __func__, ggml_op_desc(node));
+            GGML_ASSERT(false);
+            return GGML_STATUS_FAILED;
         }
-
-        return GGML_STATUS_SUCCESS;
-
-    /*
-        GGML_OP_GET_ROWS_BACK,
-        GGML_OP_DIAG,
-        GGML_OP_DIAG_MASK_INF,
-        GGML_OP_DIAG_MASK_ZERO,
-        GGML_OP_SOFT_MAX,
-        GGML_OP_SOFT_MAX_BACK,
-        GGML_OP_ROPE,
-        GGML_OP_ROPE_BACK,
-        GGML_OP_ALIBI,
-        GGML_OP_CLAMP,
-        GGML_OP_CONV_TRANSPOSE_1D,
-        GGML_OP_IM2COL,
-        GGML_OP_CONV_TRANSPOSE_2D,
-        GGML_OP_POOL_1D,
-        GGML_OP_POOL_2D,
-        GGML_OP_UPSCALE, // nearest interpolate
-        GGML_OP_PAD,
-        GGML_OP_ARANGE,
-        GGML_OP_TIMESTEP_EMBEDDING,
-        GGML_OP_ARGSORT,
-        GGML_OP_LEAKY_RELU,
-
-        GGML_OP_FLASH_ATTN,
-        GGML_OP_FLASH_FF,
-        GGML_OP_FLASH_ATTN_BACK,
-        GGML_OP_SSM_CONV,
-        GGML_OP_SSM_SCAN,
-        GGML_OP_WIN_PART,
-        GGML_OP_WIN_UNPART,
-        GGML_OP_GET_REL_POS,
-        GGML_OP_ADD_REL_POS,
-
-        GGML_OP_UNARY,
-
-        GGML_OP_MAP_UNARY,
-        GGML_OP_MAP_BINARY,
-
-        GGML_OP_MAP_CUSTOM1_F32,
-        GGML_OP_MAP_CUSTOM2_F32,
-        GGML_OP_MAP_CUSTOM3_F32,
-
-        GGML_OP_MAP_CUSTOM1,
-        GGML_OP_MAP_CUSTOM2,
-        GGML_OP_MAP_CUSTOM3,
-
-        GGML_OP_CROSS_ENTROPY_LOSS,
-        GGML_OP_CROSS_ENTROPY_LOSS_BACK,
-    */
+        return it->second.compute(backend, node);
 }
 
 static bool ggml_backend_dnnl_node_supported(ggml_backend_t backend, const struct ggml_tensor * node) {
-    GGML_UNUSED(backend);
-    // return false;
-    switch (node->op) {
-        case GGML_OP_NONE:
-            return true;
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-        case GGML_OP_ADD:
-        case GGML_OP_ADD1:
-        case GGML_OP_SUB:
-        case GGML_OP_MUL:
-        case GGML_OP_DIV:
-        case GGML_OP_SQR:
-        case GGML_OP_SQRT:
-        case GGML_OP_LOG:
-        case GGML_OP_CONT:
-        case GGML_OP_CPY:
-        case GGML_OP_DUP:
-        case GGML_OP_SCALE:
-        case GGML_OP_DIAG_MASK_ZERO:
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_GET_ROWS:
-            return ggml_dnnl_tensor_supported(node) && ggml_dnnl_tensor_supported(node->src[0]);
-        case GGML_OP_MUL_MAT:
-            return ggml_compute_forward_mul_mat_use_dnnl(node);
-        case GGML_OP_UNARY:
-        {
-            enum ggml_unary_op uop = ggml_get_unary_op(node);
-            switch(uop) {
-                case GGML_UNARY_OP_ABS:
-                case GGML_UNARY_OP_TANH:
-                case GGML_UNARY_OP_ELU:
-                case GGML_UNARY_OP_RELU:
-                case GGML_UNARY_OP_GELU:
-                case GGML_UNARY_OP_GELU_QUICK:
-                case GGML_UNARY_OP_HARDSWISH:
-                case GGML_UNARY_OP_HARDSIGMOID:
-                    return ggml_dnnl_tensor_supported(node) && ggml_dnnl_tensor_supported(node->src[0]);
-                default:
-                    // GGML_UNARY_OP_SGN,
-                    // GGML_UNARY_OP_NEG,
-                    // GGML_UNARY_OP_STEP,
-                    // GGML_UNARY_OP_SILU,
-                    return false;
-            }
-        }
-
-        default:
-            return false;
-    }
+        auto op_map = ggml_dnnl_op_map();
+        auto it = op_map->find(node->op);
+        return (it != op_map->end()) && it->second.support_op(backend, node);
 }
 
 // buffer interface
@@ -986,20 +931,23 @@ GGML_CALL static ggml_backend_buffer_type_t ggml_backend_dnnl_get_default_buffer
 #else 
 // CPU buffer type
 
-GGML_CALL static const char * ggml_backend_dnnl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
-    return ggml_backend_dnnl_name_str;
+// GGML_CALL static const char * ggml_backend_dnnl_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+//     return ggml_backend_dnnl_name_str;
 
-    GGML_UNUSED(buft);
-}
+//     GGML_UNUSED(buft);
+// }
 
-GGML_CALL static bool ggml_backend_dnnl_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;
+// GGML_CALL static bool ggml_backend_dnnl_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+//     return true;
 
-    GGML_UNUSED(buft);
-}
+//     GGML_UNUSED(buft);
+// }
 
 GGML_CALL static ggml_backend_buffer_type_t ggml_backend_dnnl_get_default_buffer_type(ggml_backend_t backend) {
     GGML_UNUSED(backend);
+#if 1
+    return ggml_backend_cpu_buffer_type();
+#else
     auto cpu_buffer_type = ggml_backend_cpu_buffer_type();
     static struct ggml_backend_buffer_type ggml_backend_dnnl_buffer_type = {
         /* .iface = */ {
@@ -1013,6 +961,7 @@ GGML_CALL static ggml_backend_buffer_type_t ggml_backend_dnnl_get_default_buffer
         /* .context = */ NULL,
     };
     return &ggml_backend_dnnl_buffer_type;
+#endif
 }
 #endif
 
@@ -1035,10 +984,10 @@ GGML_CALL static void ggml_backend_dnnl_free(ggml_backend_t backend) {
     // delete backend;
 }
 
-GGML_CALL static void ggml_backend_dnnl_synchronize(ggml_backend_t backend) {
-    auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
-    ctx->stream.wait();
-}
+// GGML_CALL static void ggml_backend_dnnl_synchronize(ggml_backend_t backend) {
+//     auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
+//     ctx->stream.wait();
+// }
 
 GGML_CALL static ggml_status ggml_backend_dnnl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     //auto * ctx = static_cast<ggml_dnnl_context *>(backend->context);
@@ -1059,17 +1008,18 @@ GGML_CALL static bool ggml_backend_dnnl_supports_op(ggml_backend_t backend, cons
     return ggml_backend_dnnl_node_supported(backend, op);
 }
 
-static bool ggml_backend_buft_is_dnnl(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_dnnl_buffer_type_get_name;
-}
+// static bool ggml_backend_buft_is_dnnl(ggml_backend_buffer_type_t buft) {
+//     return buft->iface.get_name == ggml_backend_dnnl_buffer_type_get_name;
+// }
 
 GGML_CALL static bool ggml_backend_dnnl_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_host(buft);
+// #if USE_DNNL_BUFFER
+//     return ggml_backend_buft_is_dnnl(buft);
+// #else
+//     return /*ggml_backend_buft_is_dnnl(buft); //||*/ ggml_backend_buft_is_host(buft);
+// #endif
     GGML_UNUSED(backend);
-#if USE_DNNL_BUFFER
-    return ggml_backend_buft_is_dnnl(buft);
-#else
-    return ggml_backend_buft_is_dnnl(buft) || ggml_backend_buft_is_host(buft);
-#endif
 }
 
 
@@ -1080,7 +1030,7 @@ static struct ggml_backend_i dnnl_backend_i = {
     /* .set_tensor_async        = */ NULL,
     /* .get_tensor_async        = */ NULL,
     /* .cpy_tensor_async        = */ NULL,
-    /* .synchronize             = */ ggml_backend_dnnl_synchronize,
+    /* .synchronize             = */ NULL, //ggml_backend_dnnl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
